@@ -32,7 +32,8 @@ intents.members = True
 bot = commands.Bot(command_prefix='!', intents=intents)
 
 # --- Database setup ---
-conn = sqlite3.connect(DB_PATH)
+# check_same_thread=False macht sqlite robuster in async-Umgebungen
+conn = sqlite3.connect(DB_PATH, check_same_thread=False)
 conn.row_factory = sqlite3.Row
 c = conn.cursor()
 c.execute('''
@@ -74,7 +75,10 @@ class TicketSelect(ui.Select):
             discord.SelectOption(label='Staff Help', value='staff', description='Reach staff about your questions and concerns!', emoji='⚙️'),
             discord.SelectOption(label='Other', value='other', description='All other questions or requests', emoji='❓')
         ]
-        super().__init__(placeholder='Choose a reason for your ticket', min_values=1, max_values=1, options=options)
+        # custom_id setzen, damit die View persistent registriert werden kann
+        super().__init__(placeholder='Choose a reason for your ticket',
+                         min_values=1, max_values=1, options=options,
+                         custom_id='ticket_select')
 
     async def callback(self, interaction: discord.Interaction):
         await interaction.response.defer(ephemeral=True)
@@ -86,7 +90,9 @@ class TicketSelect(ui.Select):
             embed = make_embed('Error', 'Channel not found.')
             return await interaction.followup.send(embed=embed, ephemeral=True)
 
-        perms = channel.permissions_for(interaction.guild.me)
+        # permissions_for expects a Member; interaction.guild.me sollte vorhanden sein
+        bot_member = interaction.guild.me if interaction.guild else None
+        perms = channel.permissions_for(bot_member) if bot_member else channel.permissions_for(interaction.guild.get_member(bot.user.id))
         if not perms.create_private_threads:
             embed = make_embed('Permission error', 'I do not have permission to create private threads in this channel.')
             return await interaction.followup.send(embed=embed, ephemeral=True)
@@ -158,7 +164,8 @@ class TicketSelectView(ui.View):
 
 class CloseButton(ui.Button):
     def __init__(self, thread_owner_id: Optional[int]):
-        super().__init__(label='Close ticket', style=discord.ButtonStyle.danger)
+        # custom_id setzen für mögliche persistente Registrierung
+        super().__init__(label='Close ticket', style=discord.ButtonStyle.danger, custom_id='close_ticket_button')
         self.thread_owner_id = thread_owner_id
 
     async def callback(self, interaction: discord.Interaction):
@@ -200,12 +207,14 @@ class CloseButton(ui.Button):
 class TicketThreadView(ui.View):
     def __init__(self, thread_owner_id: Optional[int]):
         super().__init__(timeout=None)
+        # CloseButton hat custom_id gesetzt
         self.add_item(CloseButton(thread_owner_id))
 
 
 # --- Slash command to post the menu ---
-
+# Wir binden den Command ausdrücklich an die konfigurierte Guild, das macht die Iteration schneller und zuverlässiger.
 @bot.tree.command(name='ticket_setup', description='Post the ticket dropdown menu to a channel')
+@app_commands.guilds(discord.Object(id=GUILD_ID))
 @app_commands.describe(channel='Channel to post the ticket select menu into')
 async def ticket_setup(interaction: discord.Interaction, channel: discord.TextChannel):
     # only allow in configured guild
@@ -213,7 +222,8 @@ async def ticket_setup(interaction: discord.Interaction, channel: discord.TextCh
         embed = make_embed('Wrong Guild', 'This command is only allowed in the configured guild.')
         return await interaction.response.send_message(embed=embed, ephemeral=True)
 
-    perms = channel.permissions_for(interaction.guild.me)
+    bot_member = interaction.guild.me if interaction.guild else None
+    perms = channel.permissions_for(bot_member) if bot_member else channel.permissions_for(interaction.guild.get_member(bot.user.id))
     if not (perms.send_messages and perms.create_private_threads and perms.read_message_history):
         embed = make_embed('Missing Permissions', 'Bot requires: Send Messages, Create Private Threads, Read Message History in that channel.')
         return await interaction.response.send_message(embed=embed, ephemeral=True)
@@ -233,12 +243,31 @@ async def ticket_setup(interaction: discord.Interaction, channel: discord.TextCh
 
 @bot.event
 async def on_ready():
-    print('Logged in as', bot.user)
+    print('Logged in as', bot.user, '— id:', bot.user.id)
+    # register persistent view instances (Select menu) so interactions still work after restart
+    try:
+        bot.add_view(TicketSelectView())  # persistent select for the ticket menu
+        # Note: TicketThreadView instances are created per-thread (they include owner info).
+    except Exception as e:
+        print('Could not add persistent views:', e)
+
     # sync tree to the specific guild for faster iteration
     try:
         await bot.tree.sync(guild=discord.Object(id=GUILD_ID))
+        print('Command tree synced to guild', GUILD_ID)
     except Exception as e:
-        print('Command sync failed:', e)
+        print('Command sync failed for guild, attempting global sync fallback:', e)
+        try:
+            await bot.tree.sync()
+            print('Global sync succeeded')
+        except Exception as ge:
+            print('Global sync failed as well:', ge)
+
+    # debug: list registered commands
+    try:
+        print('Registered app commands:', bot.tree.commands)
+    except Exception:
+        pass
 
     # optional auto-post
     if POST_CHANNEL_ID:
