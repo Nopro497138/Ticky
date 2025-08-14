@@ -12,7 +12,6 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-TOKEN = os.getenv('DISCORD_TOKEN')
 GUILD_ID = int(os.getenv('GUILD_ID')) if os.getenv('GUILD_ID') else None
 STAFF_ROLE_ID = int(os.getenv('STAFF_ROLE_ID')) if os.getenv('STAFF_ROLE_ID') else None
 DB_PATH = os.getenv('DB_PATH', './tickets.sqlite')
@@ -253,4 +252,4 @@ async def on_ready():
 
 
 if __name__ == '__main__':
-    bot.run(DISCORD_TOKEN)
+    bot.run(os.getenv("DISCORD_TOKEN"))
