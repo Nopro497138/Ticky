@@ -12,11 +12,14 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+TOKEN = os.getenv('DISCORD_TOKEN')
 GUILD_ID = int(os.getenv('GUILD_ID')) if os.getenv('GUILD_ID') else None
 STAFF_ROLE_ID = int(os.getenv('STAFF_ROLE_ID')) if os.getenv('STAFF_ROLE_ID') else None
 DB_PATH = os.getenv('DB_PATH', './tickets.sqlite')
 POST_CHANNEL_ID = int(os.getenv('POST_CHANNEL_ID')) if os.getenv('POST_CHANNEL_ID') else None
 STAFF_ADD_LIMIT = int(os.getenv('STAFF_ADD_LIMIT', '20'))
+
+DEFAULT_COLOR = 0x5865F2
 
 if not TOKEN or not GUILD_ID:
     print('Please set DISCORD_TOKEN and GUILD_ID in your .env')
@@ -50,6 +53,10 @@ conn.commit()
 def now_ts() -> int:
     return int(datetime.utcnow().timestamp())
 
+def make_embed(title: str, description: str, color: int = DEFAULT_COLOR) -> discord.Embed:
+    e = discord.Embed(title=title, description=description, color=color)
+    e.timestamp = datetime.utcnow()
+    return e
 
 def thread_safe_name(choice: str, username: str) -> str:
     base = (choice or 'ticket').lower()
@@ -67,7 +74,7 @@ class TicketSelect(ui.Select):
             discord.SelectOption(label='Staff Help', value='staff', description='Reach staff about your questions and concerns!', emoji='⚙️'),
             discord.SelectOption(label='Other', value='other', description='All other questions or requests', emoji='❓')
         ]
-        super().__init__(placeholder='Wähle einen Grund für dein Ticket', min_values=1, max_values=1, options=options)
+        super().__init__(placeholder='Choose a reason for your ticket', min_values=1, max_values=1, options=options)
 
     async def callback(self, interaction: discord.Interaction):
         await interaction.response.defer(ephemeral=True)
@@ -76,17 +83,20 @@ class TicketSelect(ui.Select):
         channel = interaction.channel
 
         if not channel or not isinstance(channel, discord.TextChannel):
-            return await interaction.followup.send('Fehler: Kanal nicht gefunden.', ephemeral=True)
+            embed = make_embed('Error', 'Channel not found.')
+            return await interaction.followup.send(embed=embed, ephemeral=True)
 
         perms = channel.permissions_for(interaction.guild.me)
         if not perms.create_private_threads:
-            return await interaction.followup.send('Ich habe keine Berechtigung, private Threads zu erstellen.', ephemeral=True)
+            embed = make_embed('Permission error', 'I do not have permission to create private threads in this channel.')
+            return await interaction.followup.send(embed=embed, ephemeral=True)
 
         thread_name = thread_safe_name(choice, user.name)
         try:
             thread = await channel.create_thread(name=thread_name, type=discord.ChannelType.private_thread, auto_archive_duration=1440)
         except Exception as e:
-            return await interaction.followup.send(f'Fehler beim Erstellen des Threads: {e}', ephemeral=True)
+            embed = make_embed('Error creating thread', f'An error occurred while creating the thread:\n```\n{e}\n```')
+            return await interaction.followup.send(embed=embed, ephemeral=True)
 
         # add creator
         try:
@@ -111,9 +121,6 @@ class TicketSelect(ui.Select):
                             continue
                     if len(members) > STAFF_ADD_LIMIT:
                         fallback_role_mention = True
-                else:
-                    # no members with role
-                    pass
 
         # save ticket
         try:
@@ -124,22 +131,23 @@ class TicketSelect(ui.Select):
         except Exception:
             pass
 
-        # send welcome message with close button
+        # send welcome message with close button (embed)
         v = TicketThreadView(thread_owner_id=user.id)
         human = {'purchase': 'Purchase Items', 'staff': 'Staff Help', 'other': 'Other'}.get(choice, choice)
-        content = f'Hallo {user.mention}, danke für dein Ticket ({human}). Ein Mitglied des Staffs wird gleich antworten.'
+        description = f'Hello {user.mention}, thanks for your ticket ({human}). A staff member will respond shortly.'
         if fallback_role_mention and STAFF_ROLE_ID:
-            content += f"
+            description += f'\n\nNote: Many staff members detected — pinging role: <@&{STAFF_ROLE_ID}>'
 
-Hinweis: Viele Staff-Mitglieder vorhanden — ping: <@&{STAFF_ROLE_ID}>"
-
+        thread_embed = make_embed('New Ticket', description)
         try:
-            await thread.send(content=content, view=v)
+            await thread.send(embed=thread_embed, view=v)
         except Exception:
             # ignore send errors
             pass
 
-        return await interaction.followup.send(f'Ticket erstellt: {thread.mention}', ephemeral=True)
+        # ephemeral confirmation embed to the user
+        confirm_embed = make_embed('Ticket Created', f'Your ticket has been created: {thread.mention}')
+        return await interaction.followup.send(embed=confirm_embed, ephemeral=True)
 
 
 class TicketSelectView(ui.View):
@@ -157,7 +165,8 @@ class CloseButton(ui.Button):
         # must be used in a thread context
         channel = interaction.channel
         if not channel or not isinstance(channel, discord.Thread):
-            return await interaction.response.send_message('Dieser Knopf funktioniert nur in Ticket-Threads.', ephemeral=True)
+            embed = make_embed('Invalid Context', 'This button only works inside ticket threads.')
+            return await interaction.response.send_message(embed=embed, ephemeral=True)
 
         # fetch ticket info from DB
         cur = conn.cursor()
@@ -174,15 +183,18 @@ class CloseButton(ui.Button):
 
         is_owner = ticket_owner_id == member.id
         if not (is_staff or is_owner):
-            return await interaction.response.send_message('Nur der Ticket-Ersteller oder Staff kann dieses Ticket schließen.', ephemeral=True)
+            embed = make_embed('Permission Denied', 'Only the ticket creator or staff can close this ticket.')
+            return await interaction.response.send_message(embed=embed, ephemeral=True)
 
         try:
             await channel.edit(archived=True)
             cur.execute('UPDATE tickets SET status = ?, closed_at = ? WHERE thread_id = ?', ('closed', now_ts(), str(channel.id)))
             conn.commit()
-            return await interaction.response.send_message('Ticket wurde geschlossen und archiviert.', ephemeral=True)
+            embed = make_embed('Ticket Closed', 'Ticket closed and archived.')
+            return await interaction.response.send_message(embed=embed, ephemeral=True)
         except Exception as e:
-            return await interaction.response.send_message(f'Fehler beim Schließen des Tickets: {e}', ephemeral=True)
+            embed = make_embed('Error Closing Ticket', f'An error occurred while closing the ticket:\n```\n{e}\n```')
+            return await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
 class TicketThreadView(ui.View):
@@ -198,19 +210,23 @@ class TicketThreadView(ui.View):
 async def ticket_setup(interaction: discord.Interaction, channel: discord.TextChannel):
     # only allow in configured guild
     if interaction.guild_id != GUILD_ID:
-        return await interaction.response.send_message('Dieser Befehl ist nur in der konfigurierten Gilde erlaubt.', ephemeral=True)
+        embed = make_embed('Wrong Guild', 'This command is only allowed in the configured guild.')
+        return await interaction.response.send_message(embed=embed, ephemeral=True)
 
     perms = channel.permissions_for(interaction.guild.me)
     if not (perms.send_messages and perms.create_private_threads and perms.read_message_history):
-        return await interaction.response.send_message('Bot benötigt: Send Messages, Create Private Threads, Read Message History in diesem Kanal.', ephemeral=True)
+        embed = make_embed('Missing Permissions', 'Bot requires: Send Messages, Create Private Threads, Read Message History in that channel.')
+        return await interaction.response.send_message(embed=embed, ephemeral=True)
 
-    embed = discord.Embed(title='Make a selection', description='Wähle die passende Option aus, um ein Ticket zu eröffnen.', color=0x5865F2)
+    embed = make_embed('Make a selection', 'Choose the appropriate option to open a ticket.')
     view = TicketSelectView()
     try:
         await channel.send(embed=embed, view=view)
-        await interaction.response.send_message(f'Ticket-Auswahl wurde in {channel.mention} gepostet.', ephemeral=True)
+        confirm = make_embed('Posted', f'Ticket menu posted in {channel.mention}.')
+        await interaction.response.send_message(embed=confirm, ephemeral=True)
     except Exception as e:
-        await interaction.response.send_message(f'Fehler beim Posten: {e}', ephemeral=True)
+        error_embed = make_embed('Error posting menu', f'An error occurred while posting the menu:\n```\n{e}\n```')
+        await interaction.response.send_message(embed=error_embed, ephemeral=True)
 
 
 # --- on_ready: sync commands & optionally auto-post menu ---
@@ -229,12 +245,12 @@ async def on_ready():
         try:
             ch = bot.get_channel(POST_CHANNEL_ID) or await bot.fetch_channel(POST_CHANNEL_ID)
             if isinstance(ch, discord.TextChannel):
-                embed = discord.Embed(title='Make a selection', description='Wähle die passende Option aus, um ein Ticket zu eröffnen.', color=0x5865F2)
+                embed = make_embed('Make a selection', 'Choose the appropriate option to open a ticket.')
                 await ch.send(embed=embed, view=TicketSelectView())
                 print('Posted ticket menu automatically in', ch.id)
         except Exception as e:
             print('Could not auto-post menu:', e)
 
 
-
-bot.run(os.getenv("DISCORD_TOKEN"))
+if __name__ == '__main__':
+    bot.run(DISCORD_TOKEN)
