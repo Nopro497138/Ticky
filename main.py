@@ -21,7 +21,7 @@ STAFF_ADD_LIMIT = int(os.getenv('STAFF_ADD_LIMIT', '20'))
 
 DEFAULT_COLOR = 0x5865F2
 
-if not TOKEN or not GUILD_ID:
+if not DISCORD_TOKEN or not GUILD_ID:
     print('Please set DISCORD_TOKEN and GUILD_ID in your .env')
     raise SystemExit(1)
 
